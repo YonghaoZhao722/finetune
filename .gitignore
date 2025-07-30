@@ -1,12 +1,4 @@
-/._DIC
-/._DIC_mask
-/._README_finetune.md
-/._data_preprocessing.py
-/._finetune_hela.py
-/._finetune_sam_using_peft.py
-/._lora_finetune.py
-/._normal_finetune.py
-/._processed_data
+._*
 /DIC
 /DIC_mask
 /README_finetune.md
