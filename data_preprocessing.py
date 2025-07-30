@@ -89,7 +89,53 @@ def process_mask(mask_path):
     return labeled_mask.astype(np.uint16)
 
 
-def copy_and_process_data(file_pairs, dic_folder, mask_folder, output_folder, split_name):
+def normalize_16bit_to_8bit(image, percentile_normalization=True, lower_percentile=1, upper_percentile=99):
+    """
+    Normalize 16-bit image to 8-bit range [0, 255].
+    
+    Args:
+        image: Input image array
+        percentile_normalization: If True, use percentile-based normalization for better contrast
+        lower_percentile: Lower percentile for clipping (default: 1)
+        upper_percentile: Upper percentile for clipping (default: 99)
+    """
+    if image.dtype == np.uint8:
+        return image  # Already 8-bit
+    
+    # Convert to float for processing
+    image_float = image.astype(np.float32)
+    
+    if percentile_normalization:
+        # Use percentile-based normalization for better contrast
+        lower_bound = np.percentile(image_float, lower_percentile)
+        upper_bound = np.percentile(image_float, upper_percentile)
+        
+        # Clip values to percentile range
+        image_float = np.clip(image_float, lower_bound, upper_bound)
+        
+        # Normalize to [0, 1]
+        if upper_bound > lower_bound:
+            image_float = (image_float - lower_bound) / (upper_bound - lower_bound)
+        else:
+            image_float = np.zeros_like(image_float)
+    else:
+        # Simple min-max normalization
+        min_val = image_float.min()
+        max_val = image_float.max()
+        
+        if max_val > min_val:
+            image_float = (image_float - min_val) / (max_val - min_val)
+        else:
+            image_float = np.zeros_like(image_float)
+    
+    # Scale to [0, 255] and convert to uint8
+    image_8bit = (image_float * 255).astype(np.uint8)
+    
+    return image_8bit
+
+
+def copy_and_process_data(file_pairs, dic_folder, mask_folder, output_folder, split_name, 
+                         percentile_norm=True, lower_perc=1, upper_perc=99):
     """Copy and process data files to output folder."""
     output_dic = os.path.join(output_folder, split_name, 'images')
     output_mask = os.path.join(output_folder, split_name, 'masks')
@@ -106,11 +152,18 @@ def copy_and_process_data(file_pairs, dic_folder, mask_folder, output_folder, sp
             if os.path.exists(dic_path):
                 dic_image = imread(dic_path)
                 
-                # Ensure image is in correct format (uint8 or uint16)
-                if dic_image.dtype not in [np.uint8, np.uint16]:
-                    # Normalize to uint8 range
-                    dic_image = ((dic_image - dic_image.min()) / 
-                                (dic_image.max() - dic_image.min()) * 255).astype(np.uint8)
+                print(f"Processing {filename}: Original dtype={dic_image.dtype}, shape={dic_image.shape}, "
+                      f"range=[{dic_image.min()}, {dic_image.max()}]")
+                
+                # Normalize 16-bit images to 8-bit [0, 255] range
+                dic_image = normalize_16bit_to_8bit(
+                    dic_image, 
+                    percentile_normalization=percentile_norm,
+                    lower_percentile=lower_perc,
+                    upper_percentile=upper_perc
+                )
+                
+                print(f"  -> Normalized: dtype={dic_image.dtype}, range=[{dic_image.min()}, {dic_image.max()}]")
                 
                 # Save DIC image
                 output_dic_path = os.path.join(output_dic, filename)
@@ -167,6 +220,17 @@ def main():
     parser.add_argument("--random_state", type=int, default=42, 
                       help="Random state for reproducible splits")
     
+    # Normalization arguments for 16-bit data
+    parser.add_argument("--percentile_normalization", action="store_true", default=True,
+                      help="Use percentile-based normalization for better contrast")
+    parser.add_argument("--no_percentile_normalization", dest="percentile_normalization", 
+                      action="store_false",
+                      help="Use simple min-max normalization instead")
+    parser.add_argument("--lower_percentile", type=float, default=1.0,
+                      help="Lower percentile for clipping (default: 1.0)")
+    parser.add_argument("--upper_percentile", type=float, default=99.0,
+                      help="Upper percentile for clipping (default: 99.0)")
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -188,6 +252,9 @@ def main():
     print(f"  Mask folder: {args.mask_folder}")
     print(f"  Output folder: {args.output_folder}")
     print(f"  Train/Val split: {args.train_ratio:.1f}/{args.val_ratio:.1f}")
+    print(f"  Normalization: {'Percentile' if args.percentile_normalization else 'Min-Max'}")
+    if args.percentile_normalization:
+        print(f"  Percentile range: {args.lower_percentile}% - {args.upper_percentile}%")
     
     # Get file pairs
     file_pairs = get_file_pairs(args.dic_folder, args.mask_folder)
@@ -211,13 +278,19 @@ def main():
     # Process training data
     print(f"\nProcessing training data...")
     train_count = copy_and_process_data(
-        train_files, args.dic_folder, args.mask_folder, args.output_folder, 'train'
+        train_files, args.dic_folder, args.mask_folder, args.output_folder, 'train',
+        percentile_norm=args.percentile_normalization,
+        lower_perc=args.lower_percentile,
+        upper_perc=args.upper_percentile
     )
     
     # Process validation data
     print(f"\nProcessing validation data...")
     val_count = copy_and_process_data(
-        val_files, args.dic_folder, args.mask_folder, args.output_folder, 'val'
+        val_files, args.dic_folder, args.mask_folder, args.output_folder, 'val',
+        percentile_norm=args.percentile_normalization,
+        lower_perc=args.lower_percentile,
+        upper_perc=args.upper_percentile
     )
     
     print(f"\nData preprocessing complete!")
