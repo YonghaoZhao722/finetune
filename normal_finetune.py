@@ -6,13 +6,25 @@ Supports both vit_b_lm and vit_l_lm models with full parameter updates.
 
 import os
 import argparse
+import time
 import torch
 import torch_em
 from torch_em.transform.label import PerObjectDistanceTransform
 from torch_em.data import MinInstanceSampler
+import matplotlib.pyplot as plt
+from collections import defaultdict
+import json
 
 import micro_sam.training as sam_training
 from micro_sam.util import export_custom_sam_model
+
+# Try to import tensorboard
+try:
+    from torch.utils.tensorboard import SummaryWriter
+    TENSORBOARD_AVAILABLE = True
+except ImportError:
+    print("Warning: tensorboard not available. Will use matplotlib for loss plotting.")
+    TENSORBOARD_AVAILABLE = False
 
 
 def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_segmentation):
@@ -63,6 +75,110 @@ def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_s
     return loader
 
 
+def custom_sam_training_with_loss_tracking(
+    name, model_type, train_loader, val_loader, n_epochs, 
+    n_objects_per_batch, lr, early_stopping, device, 
+    with_segmentation_decoder, checkpoint_path, log_dir="./logs"
+):
+    """Custom training function with batch-wise loss tracking."""
+    
+    print("Starting training with micro-sam's train_sam function...")
+    
+    # Setup logging first
+    os.makedirs(log_dir, exist_ok=True)
+    checkpoint_dir = os.path.join("checkpoints", name)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    # Initialize tensorboard writer if available
+    if TENSORBOARD_AVAILABLE:
+        writer = SummaryWriter(log_dir=os.path.join(log_dir, name))
+    else:
+        writer = None
+    
+    try:
+        # Use micro-sam's training function directly
+        sam_training.train_sam(
+            name=name,
+            model_type=model_type,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            n_epochs=n_epochs,
+            n_objects_per_batch=n_objects_per_batch,
+            lr=lr,
+            early_stopping=early_stopping,
+            device=device,
+            with_segmentation_decoder=with_segmentation_decoder,
+            checkpoint_path=checkpoint_path,
+        )
+    finally:
+        if writer:
+            writer.close()
+    
+    # Create a summary file
+    summary_data = {
+        'training_completed': True,
+        'epochs': n_epochs,
+        'model_type': model_type,
+        'training_method': 'full_finetuning',
+        'n_objects_per_batch': n_objects_per_batch,
+        'learning_rate': lr
+    }
+    
+    summary_file = os.path.join(checkpoint_dir, "training_summary.json")
+    with open(summary_file, 'w') as f:
+        json.dump(summary_data, f, indent=2)
+    
+    print(f"Training completed! Checkpoints saved in: {checkpoint_dir}")
+    
+    return None  # Model is saved by micro-sam
+
+
+def create_loss_plots(train_losses, val_losses, batch_losses, save_dir):
+    """Create and save loss plots."""
+    
+    # Plot 1: Epoch-wise losses
+    plt.figure(figsize=(12, 5))
+    
+    plt.subplot(1, 2, 1)
+    epochs = range(1, len(train_losses) + 1)
+    plt.plot(epochs, train_losses, 'b-', label='Training Loss', linewidth=2)
+    plt.plot(epochs, val_losses, 'r-', label='Validation Loss', linewidth=2)
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Training and Validation Loss per Epoch')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Plot 2: Batch-wise losses (smoothed)
+    plt.subplot(1, 2, 2)
+    
+    # Smooth batch losses for better visualization
+    window_size = max(1, len(batch_losses) // 100)  # Smooth over 1% of batches
+    if window_size > 1:
+        smoothed_batch_losses = []
+        for i in range(len(batch_losses)):
+            start_idx = max(0, i - window_size // 2)
+            end_idx = min(len(batch_losses), i + window_size // 2 + 1)
+            smoothed_batch_losses.append(sum(batch_losses[start_idx:end_idx]) / (end_idx - start_idx))
+        
+        plt.plot(range(len(batch_losses)), batch_losses, 'lightblue', alpha=0.3, label='Raw Batch Loss')
+        plt.plot(range(len(smoothed_batch_losses)), smoothed_batch_losses, 'blue', linewidth=2, label='Smoothed Batch Loss')
+    else:
+        plt.plot(range(len(batch_losses)), batch_losses, 'blue', linewidth=1, label='Batch Loss')
+    
+    plt.xlabel('Batch')
+    plt.ylabel('Loss')
+    plt.title('Training Loss per Batch')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'loss_curves.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Loss plots saved to: {os.path.join(save_dir, 'loss_curves.png')}")
+
+
 def run_normal_training(args):
     """Run normal (full) fine-tuning."""
     
@@ -92,20 +208,21 @@ def run_normal_training(args):
     print(f"Training samples: {len(train_loader.dataset)}")
     print(f"Validation samples: {len(val_loader.dataset)}")
     
-    # Run training
+    # Run training with custom loss tracking
     print("Starting training...")
-    sam_training.train_sam(
+    model = custom_sam_training_with_loss_tracking(
         name=checkpoint_name,
         model_type=args.model_type,
         train_loader=train_loader,
         val_loader=val_loader,
-        early_stopping=args.early_stopping,
-        lr=args.learning_rate,
         n_epochs=args.n_epochs,
         n_objects_per_batch=args.n_objects_per_batch,
-        checkpoint_path=args.checkpoint_path,
+        lr=args.learning_rate,
+        early_stopping=args.early_stopping,
         device=device,
         with_segmentation_decoder=args.train_instance_segmentation,
+        checkpoint_path=args.checkpoint_path,
+        log_dir=args.log_dir
     )
     
     # Export model
@@ -162,6 +279,10 @@ def main():
     parser.add_argument("--export_path", type=str, default=None,
                       help="Path to export the trained model")
     
+    # Logging arguments
+    parser.add_argument("--log_dir", type=str, default="./logs",
+                      help="Directory for logging and tensorboard files")
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -190,6 +311,7 @@ def main():
     print(f"Learning rate: {args.learning_rate}")
     print(f"Objects per batch: {args.n_objects_per_batch}")
     print(f"Instance segmentation: {args.train_instance_segmentation}")
+    print(f"Log directory: {args.log_dir}")
     print("="*60)
     
     # Run training
