@@ -13,7 +13,7 @@ from micro_sam.util import export_custom_sam_model, export_custom_qlora_model
 from peft_sam.util import get_default_peft_kwargs, RawTrafo
 
 
-DATA_ROOT = "./data/orgasegment"
+DATA_ROOT = "/Volumes/ExFAT/finetune/processed_data"
 
 
 def get_data_loaders(input_path):
@@ -42,9 +42,9 @@ def finetune_sam(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # training settings:
-    model_type = "vit_b"  # override this to start training from another model supported by 'micro-sam'.
+    model_type = "vit_b_lm"  # override this to start training from another model supported by 'micro-sam'.
     checkpoint_path = None  # override this to start training from a custom checkpoint.
-    n_objects_per_batch = 5  # this is the number of objects per batch that will be sampled.
+    n_objects_per_batch = 20  # this is the number of objects per batch that will be sampled.
 
     # whether to freeze the entire image encoder.
     if args.peft_method == "freeze_encoder":
@@ -70,9 +70,9 @@ def finetune_sam(args):
         model_type=model_type,
         train_loader=train_loader,
         val_loader=val_loader,
-        early_stopping=10,
-        lr=1e-5,
-        n_epochs=100,
+        early_stopping=15,
+        lr=5e-6,
+        n_epochs=200,
         n_objects_per_batch=n_objects_per_batch,
         checkpoint_path=checkpoint_path,
         freeze=freeze_parts,  # override this to freeze different parts of the model
