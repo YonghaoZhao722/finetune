@@ -14,6 +14,9 @@ from torch_em.data import MinInstanceSampler
 import matplotlib.pyplot as plt
 from collections import defaultdict
 import json
+import numpy as np
+from tifffile import imread, imwrite
+import traceback
 
 import micro_sam.training as sam_training
 from micro_sam.util import export_custom_sam_model, export_custom_qlora_model
@@ -35,7 +38,120 @@ except ImportError:
     TENSORBOARD_AVAILABLE = False
 
 
-def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_segmentation):
+class DebugMinInstanceSampler(MinInstanceSampler):
+    """MinInstanceSampler with debugging capabilities to handle empty masks"""
+    
+    def __init__(self, debug_dir="./debug_empty_masks", **kwargs):
+        super().__init__(**kwargs)
+        self.debug_dir = debug_dir
+        self.empty_mask_count = 0
+        os.makedirs(debug_dir, exist_ok=True)
+        
+    def __call__(self, dataset, index):
+        try:
+            # Try the original sampling
+            return super().__call__(dataset, index)
+        except Exception as e:
+            if "No foreground objects were found" in str(e) or "no instances" in str(e).lower():
+                self.empty_mask_count += 1
+                print(f"DEBUG: Empty mask detected (count: {self.empty_mask_count})")
+                
+                # Save debug information
+                try:
+                    self._save_debug_info(dataset, index, e)
+                except Exception as debug_error:
+                    print(f"DEBUG: Failed to save debug info: {debug_error}")
+                
+                # Try to find a valid sample by checking nearby indices
+                valid_index = self._find_valid_sample(dataset, index)
+                if valid_index is not None:
+                    print(f"DEBUG: Using alternative sample at index {valid_index}")
+                    return super().__call__(dataset, valid_index)
+                else:
+                    # If we can't find any valid sample, raise the original error
+                    raise e
+            else:
+                # Re-raise other types of errors
+                raise e
+    
+    def _save_debug_info(self, dataset, index, error):
+        """Save the problematic image and mask for debugging"""
+        try:
+            # Get the raw sample without any transforms
+            sample = dataset._get_sample(index)
+            raw_image, raw_mask = sample
+            
+            # Convert to numpy if needed
+            if hasattr(raw_image, 'numpy'):
+                raw_image = raw_image.numpy()
+            if hasattr(raw_mask, 'numpy'):
+                raw_mask = raw_mask.numpy()
+            
+            # Save files with timestamp and index
+            timestamp = int(time.time())
+            debug_prefix = f"empty_mask_{timestamp}_idx{index}"
+            
+            # Save image
+            image_path = os.path.join(self.debug_dir, f"{debug_prefix}_image.tif")
+            if raw_image.ndim == 3 and raw_image.shape[0] == 1:
+                raw_image = raw_image[0]  # Remove channel dimension for saving
+            imwrite(image_path, raw_image.astype(np.uint8))
+            
+            # Save mask
+            mask_path = os.path.join(self.debug_dir, f"{debug_prefix}_mask.tif")
+            if raw_mask.ndim == 3 and raw_mask.shape[0] == 1:
+                raw_mask = raw_mask[0]  # Remove channel dimension for saving
+            imwrite(mask_path, raw_mask.astype(np.uint16))
+            
+            # Save debug info
+            info_path = os.path.join(self.debug_dir, f"{debug_prefix}_info.txt")
+            with open(info_path, 'w') as f:
+                f.write(f"Debug Info for Empty Mask\n")
+                f.write(f"========================\n")
+                f.write(f"Index: {index}\n")
+                f.write(f"Error: {error}\n")
+                f.write(f"Image shape: {raw_image.shape}\n")
+                f.write(f"Mask shape: {raw_mask.shape}\n")
+                f.write(f"Mask unique values: {np.unique(raw_mask)}\n")
+                f.write(f"Mask max value: {np.max(raw_mask)}\n")
+                f.write(f"Mask sum: {np.sum(raw_mask > 0)}\n")
+                f.write(f"Traceback:\n{traceback.format_exc()}\n")
+            
+            print(f"DEBUG: Saved debug files with prefix {debug_prefix}")
+            
+        except Exception as save_error:
+            print(f"DEBUG: Error saving debug info: {save_error}")
+    
+    def _find_valid_sample(self, dataset, original_index, max_attempts=50):
+        """Try to find a valid sample by checking nearby indices"""
+        dataset_len = len(dataset)
+        
+        for offset in range(1, min(max_attempts, dataset_len)):
+            # Try both forward and backward
+            for direction in [1, -1]:
+                test_index = (original_index + direction * offset) % dataset_len
+                try:
+                    # Quick check if this sample might be valid
+                    sample = dataset._get_sample(test_index)
+                    raw_image, raw_mask = sample
+                    
+                    # Check if mask has any foreground objects
+                    if hasattr(raw_mask, 'numpy'):
+                        mask_array = raw_mask.numpy()
+                    else:
+                        mask_array = raw_mask
+                    
+                    if np.any(mask_array > 0):
+                        # This sample looks valid, try to use it
+                        super(DebugMinInstanceSampler, self).__call__(dataset, test_index)
+                        return test_index
+                except:
+                    continue
+        
+        return None
+
+
+def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_segmentation, debug_empty_masks=True):
     """Return train or val data loader for finetuning SAM."""
     assert split in ("train", "val")
     
@@ -53,13 +169,14 @@ def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_s
     
     if train_instance_segmentation:
         # Use PerObjectDistanceTransform for automatic instance segmentation
+        # NOTE: Reduce min_size to avoid conflicts with your preprocessing
         label_transform = PerObjectDistanceTransform(
             distances=True, 
             boundary_distances=True, 
             directed_distances=False,
             foreground=True, 
             instances=True, 
-            min_size=25
+            min_size=5  # Reduced from 25 to avoid double filtering
         )
     else:
         label_transform = torch_em.transform.label.connected_components
@@ -74,6 +191,13 @@ def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_s
     else:
         raw_transform = sam_training.identity
     
+    # Use debug sampler if requested
+    if train_instance_segmentation and debug_empty_masks:
+        debug_dir = os.path.join("./debug_empty_masks", split)
+        sampler = DebugMinInstanceSampler(debug_dir=debug_dir)
+    else:
+        sampler = MinInstanceSampler() if train_instance_segmentation else None
+    
     loader = torch_em.default_segmentation_loader(
         raw_paths=image_dir, 
         raw_key=raw_key,
@@ -85,7 +209,7 @@ def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_s
         is_seg_dataset=True,
         label_transform=label_transform,
         raw_transform=raw_transform,
-        sampler=MinInstanceSampler() if train_instance_segmentation else None,
+        sampler=sampler,
         num_workers=8, 
         shuffle=True
     )
@@ -268,10 +392,10 @@ def run_lora_training(args):
     # Get data loaders
     print("Loading data...")
     train_loader = get_dataloader(
-        args.data_folder, "train", patch_shape, args.batch_size, args.train_instance_segmentation
+        args.data_folder, "train", patch_shape, args.batch_size, args.train_instance_segmentation, debug_empty_masks=True
     )
     val_loader = get_dataloader(
-        args.data_folder, "val", patch_shape, args.batch_size, args.train_instance_segmentation
+        args.data_folder, "val", patch_shape, args.batch_size, args.train_instance_segmentation, debug_empty_masks=True
     )
     
     print(f"Training samples: {len(train_loader.dataset)}")
@@ -359,8 +483,8 @@ def main():
                       help="Number of training epochs")
     parser.add_argument("--learning_rate", type=float, default=1e-5,
                       help="Learning rate")
-    parser.add_argument("--n_objects_per_batch", type=int, default=25,
-                      help="Number of objects per batch for sampling")
+    parser.add_argument("--n_objects_per_batch", type=int, default=10,
+                      help="Number of objects per batch for sampling (reduced from 25 to be less demanding)")
     parser.add_argument("--early_stopping", type=int, default=15,
                       help="Early stopping patience")
     
