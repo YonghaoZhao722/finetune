@@ -243,17 +243,13 @@ def run_lora_training(args):
         print("Using full fine-tuning (no PEFT)")
     else:
         freeze_parts = None
-        peft_kwargs = get_default_peft_kwargs(args.peft_method)
-        
-        # Custom LoRA parameters
-        if args.peft_method in ["lora", "qlora"]:
-            if args.lora_rank is not None:
-                peft_kwargs["rank"] = args.lora_rank
-            if args.lora_alpha is not None:
-                peft_kwargs["alpha"] = args.lora_alpha  # Use 'alpha' not 'lora_alpha'
-            # Note: lora_dropout is not supported by micro-sam's LoRASurgery
-            if args.lora_dropout is not None:
-                print(f"Warning: lora_dropout={args.lora_dropout} specified but not supported by micro-sam's LoRASurgery")
+        from peft_sam.util import get_peft_kwargs
+        peft_kwargs = get_peft_kwargs(
+            peft_module=args.peft_method,
+            peft_rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            dropout=args.lora_dropout,
+        )
         
         print(f"Using PEFT method: {args.peft_method}")
         print(f"PEFT arguments: {peft_kwargs}")
