@@ -3,3 +3,6 @@
 /DIC_mask
 /README_finetune.md
 /processed_data
+/peft-sam
+events*
+peft-sam
