@@ -13,7 +13,7 @@ from micro_sam.util import export_custom_sam_model, export_custom_qlora_model
 from peft_sam.util import get_default_peft_kwargs, RawTrafo
 
 
-DATA_ROOT = "/Volumes/ExFAT/finetune/processed_data"
+DATA_ROOT = "processed_data"
 
 
 def get_data_loaders(input_path):
@@ -101,7 +101,7 @@ def finetune_sam(args):
 def main():
     parser = argparse.ArgumentParser(description="Finetune Segment Anything for microscopy data.")
     parser.add_argument(
-        "--peft_method", type=str, default=None, help="The method to use for PEFT.",
+        "--peft_method", type=str, default="lora", help="The method to use for PEFT.",
         choices=[
             "freeze_encoder", "lora", "qlora", "fact", "attention_tuning",
             "adaptformer", "bias_tuning", "layernorm_tuning", "ssf", "late_lora", "late_ft"

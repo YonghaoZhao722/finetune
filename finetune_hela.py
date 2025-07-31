@@ -11,7 +11,7 @@ from micro_sam.util import export_custom_sam_model
 from micro_sam.sample_data import fetch_tracking_example_data, fetch_tracking_segmentation_data
 
 
-DATA_FOLDER = "data"
+DATA_FOLDER = "processed_data"
 
 
 def get_dataloader(split, patch_shape, batch_size, train_instance_segmentation):
@@ -104,7 +104,7 @@ def run_training(checkpoint_name, model_type, train_instance_segmentation):
 def export_model(checkpoint_name, model_type):
     """Export the trained model."""
     # export the model after training so that it can be used by the rest of the 'micro_sam' library
-    export_path = "./finetuned_hela_model.pth"
+    export_path = "./finetuned_yeast_model.pth"
     checkpoint_path = os.path.join("checkpoints", checkpoint_name, "best.pt")
     export_custom_sam_model(
         checkpoint_path=checkpoint_path,
@@ -124,7 +124,7 @@ def main():
     model_type = "vit_b"
 
     # The name of the checkpoint. The checkpoints will be stored in './checkpoints/<checkpoint_name>'
-    checkpoint_name = "sam_hela"
+    checkpoint_name = "sam_yeast"
 
     # Train an additional convolutional decoder for end-to-end automatic instance segmentation
     train_instance_segmentation = True
