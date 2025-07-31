@@ -1,4 +1,5 @@
 ._*
+/*
 /DIC
 /DIC_mask
 /README_finetune.md
@@ -7,3 +8,4 @@
 events*
 peft-sam
 *.zip
+*.md

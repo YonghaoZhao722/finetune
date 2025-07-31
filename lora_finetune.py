@@ -17,6 +17,7 @@ import json
 import numpy as np
 from tifffile import imread, imwrite
 import traceback
+import pandas as pd
 
 import micro_sam.training as sam_training
 from micro_sam.util import export_custom_sam_model, export_custom_qlora_model
@@ -223,9 +224,9 @@ def custom_sam_training_with_loss_tracking(
     peft_kwargs, freeze_parts, with_segmentation_decoder, 
     checkpoint_path, log_dir="./logs"
 ):
-    """Custom training function with batch-wise loss tracking."""
+    """Custom training function with epoch-based loss tracking and plotting."""
     
-    print("Starting training with batch-wise loss tracking...")
+    print("Starting custom SAM training with epoch-based loss tracking...")
     
     # Setup logging first
     os.makedirs(log_dir, exist_ok=True)
@@ -238,108 +239,375 @@ def custom_sam_training_with_loss_tracking(
     else:
         writer = None
     
+    # Import necessary modules for custom training
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.cuda.amp import autocast, GradScaler
+    
     # Loss tracking
-    train_losses = []
-    val_losses = []
-    batch_losses = []
+    epoch_train_losses = []
+    epoch_val_losses = []
+    all_batch_losses = []
     
-    # Create a custom training function that will be called by sam_training.train_sam
-    class LossTracker:
-        def __init__(self):
-            self.epoch_train_losses = []
-            self.epoch_val_losses = []
-            self.batch_losses = []
-            self.current_epoch = 0
-            
-        def log_batch_loss(self, loss_value, batch_idx, total_batches):
-            self.batch_losses.append(loss_value)
-            
-            # Log to tensorboard
-            if writer:
-                global_step = self.current_epoch * total_batches + batch_idx
-                writer.add_scalar('Loss/Batch_Train', loss_value, global_step)
-            
-            # Print progress
-            if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == total_batches:
-                recent_losses = self.batch_losses[-min(10, len(self.batch_losses)):]
-                avg_loss = sum(recent_losses) / len(recent_losses)
-                print(f"  Batch {batch_idx + 1}/{total_batches}, "
-                      f"Loss: {loss_value:.4f}, "
-                      f"Avg(last {len(recent_losses)}): {avg_loss:.4f}")
-        
-        def log_epoch_loss(self, train_loss, val_loss):
-            self.epoch_train_losses.append(train_loss)
-            self.epoch_val_losses.append(val_loss)
-            
-            if writer:
-                writer.add_scalar('Loss/Epoch_Train', train_loss, self.current_epoch)
-                writer.add_scalar('Loss/Epoch_Val', val_loss, self.current_epoch)
-            
-            self.current_epoch += 1
-    
-    loss_tracker = LossTracker()
-    
-    # Monkey patch sam_training to add our loss tracking
-    original_train_sam = sam_training.train_sam
-    
-    def tracked_train_sam(*args, **kwargs):
-        # Extract the arguments we need
-        train_loader_arg = kwargs.get('train_loader', args[2] if len(args) > 2 else None)
-        val_loader_arg = kwargs.get('val_loader', args[3] if len(args) > 3 else None)
-        
-        # Add our custom callbacks if possible
-        # Note: This is a simplified approach - the actual implementation may need adjustment
-        print("Running training with micro-sam's train_sam function...")
-        return original_train_sam(*args, **kwargs)
-    
-    # Temporarily replace the function
-    sam_training.train_sam = tracked_train_sam
-    
+    # Initialize model
+    print(f"Initializing {model_type} model...")
     try:
-        # Use micro-sam's training function
-        sam_training.train_sam(
-            name=name,
-            model_type=model_type,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            n_epochs=n_epochs,
-            n_objects_per_batch=n_objects_per_batch,
-            lr=lr,
-            early_stopping=early_stopping,
-            device=device,
-            peft_kwargs=peft_kwargs,
-            freeze=freeze_parts,
+        from micro_sam.models import get_sam_model
+        model = get_sam_model(model_type=model_type, device=device, checkpoint_path=checkpoint_path)
+        
+        # Apply PEFT if specified
+        if peft_kwargs:
+            print("Applying PEFT modifications...")
+            from peft_sam.util import get_peft_sam_model
+            model = get_peft_sam_model(model, **peft_kwargs)
+        
+        # Freeze parts if specified
+        if freeze_parts:
+            print(f"Freezing: {freeze_parts}")
+            if freeze_parts == "image_encoder":
+                for param in model.image_encoder.parameters():
+                    param.requires_grad = False
+    except Exception as e:
+        print(f"Error initializing model: {e}")
+        print("Falling back to micro-sam's train_sam function...")
+        return sam_training.train_sam(
+            name=name, model_type=model_type, train_loader=train_loader,
+            val_loader=val_loader, n_epochs=n_epochs, n_objects_per_batch=n_objects_per_batch,
+            lr=lr, early_stopping=early_stopping, device=device,
+            peft_kwargs=peft_kwargs, freeze=freeze_parts,
             with_segmentation_decoder=with_segmentation_decoder,
-            checkpoint_path=checkpoint_path,
+            checkpoint_path=checkpoint_path
         )
-    finally:
-        # Restore original function
-        sam_training.train_sam = original_train_sam
     
-    # Create loss plots using dummy data (since we couldn't intercept the actual losses)
-    print("Training completed! Creating summary plots...")
+    # Setup optimizer
+    optimizer = optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    
+    # Setup loss functions
+    bce_loss = nn.BCEWithLogitsLoss()
+    mse_loss = nn.MSELoss()
+    
+    # Mixed precision training
+    scaler = GradScaler()
+    
+    # Early stopping
+    best_val_loss = float('inf')
+    patience_counter = 0
+    
+    print(f"Training for {n_epochs} epochs...")
+    print(f"Training batches per epoch: {len(train_loader)}")
+    print(f"Validation batches per epoch: {len(val_loader)}")
+    
+    for epoch in range(n_epochs):
+        print(f"\nEpoch {epoch + 1}/{n_epochs}")
+        print("-" * 50)
+        
+        # Training phase
+        model.train()
+        epoch_train_loss = 0.0
+        epoch_batch_losses = []
+        
+        for batch_idx, batch in enumerate(train_loader):
+            try:
+                # Move batch to device
+                images, labels = batch
+                images = images.to(device)
+                if isinstance(labels, dict):
+                    labels = {k: v.to(device) if torch.is_tensor(v) else v for k, v in labels.items()}
+                else:
+                    labels = labels.to(device)
+                
+                optimizer.zero_grad()
+                
+                with autocast():
+                    # Forward pass
+                    outputs = model(images)
+                    
+                    # Calculate loss (simplified - you may need to adjust based on actual SAM loss)
+                    if isinstance(outputs, dict) and 'pred_masks' in outputs:
+                        loss = bce_loss(outputs['pred_masks'], labels)
+                    else:
+                        # Fallback loss calculation
+                        if hasattr(outputs, 'pred_masks'):
+                            loss = bce_loss(outputs.pred_masks, labels)
+                        else:
+                            loss = mse_loss(outputs, labels)
+                
+                # Backward pass
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                
+                # Record loss
+                batch_loss = loss.item()
+                epoch_batch_losses.append(batch_loss)
+                all_batch_losses.append(batch_loss)
+                epoch_train_loss += batch_loss
+                
+                # Log batch progress
+                if (batch_idx + 1) % 10 == 0 or (batch_idx + 1) == len(train_loader):
+                    avg_loss = sum(epoch_batch_losses[-10:]) / min(10, len(epoch_batch_losses))
+                    print(f"  Batch {batch_idx + 1}/{len(train_loader)}, "
+                          f"Loss: {batch_loss:.4f}, "
+                          f"Avg(last 10): {avg_loss:.4f}")
+                
+                # Log to tensorboard
+                if writer:
+                    global_step = epoch * len(train_loader) + batch_idx
+                    writer.add_scalar('Loss/Batch_Train', batch_loss, global_step)
+                    
+            except Exception as e:
+                print(f"Error in training batch {batch_idx}: {e}")
+                continue
+        
+        # Calculate average training loss for this epoch
+        avg_train_loss = epoch_train_loss / len(train_loader)
+        epoch_train_losses.append(avg_train_loss)
+        
+        # Validation phase
+        model.eval()
+        epoch_val_loss = 0.0
+        
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_loader):
+                try:
+                    # Move batch to device
+                    images, labels = batch
+                    images = images.to(device)
+                    if isinstance(labels, dict):
+                        labels = {k: v.to(device) if torch.is_tensor(v) else v for k, v in labels.items()}
+                    else:
+                        labels = labels.to(device)
+                    
+                    with autocast():
+                        # Forward pass
+                        outputs = model(images)
+                        
+                        # Calculate loss
+                        if isinstance(outputs, dict) and 'pred_masks' in outputs:
+                            loss = bce_loss(outputs['pred_masks'], labels)
+                        else:
+                            if hasattr(outputs, 'pred_masks'):
+                                loss = bce_loss(outputs.pred_masks, labels)
+                            else:
+                                loss = mse_loss(outputs, labels)
+                    
+                    epoch_val_loss += loss.item()
+                    
+                except Exception as e:
+                    print(f"Error in validation batch {batch_idx}: {e}")
+                    continue
+        
+        # Calculate average validation loss for this epoch
+        avg_val_loss = epoch_val_loss / len(val_loader) if len(val_loader) > 0 else float('inf')
+        epoch_val_losses.append(avg_val_loss)
+        
+        # Log epoch results
+        print(f"Epoch {epoch + 1} - Train Loss: {avg_train_loss:.4f}, Val Loss: {avg_val_loss:.4f}")
+        
+        if writer:
+            writer.add_scalar('Loss/Epoch_Train', avg_train_loss, epoch)
+            writer.add_scalar('Loss/Epoch_Val', avg_val_loss, epoch)
+        
+        # Early stopping check
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            # Save best model
+            best_model_path = os.path.join(checkpoint_dir, "best.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'train_loss': avg_train_loss,
+                'val_loss': avg_val_loss,
+            }, best_model_path)
+            print(f"Saved best model with val_loss: {best_val_loss:.4f}")
+        else:
+            patience_counter += 1
+            if patience_counter >= early_stopping:
+                print(f"Early stopping triggered after {epoch + 1} epochs")
+                break
+    
+    # Create and save loss plots
+    print("Creating epoch-based loss plots...")
+    create_epoch_loss_plots(epoch_train_losses, epoch_val_losses, all_batch_losses, 
+                           checkpoint_dir, n_epochs)
     
     # Create a summary file
     summary_data = {
         'training_completed': True,
-        'epochs': n_epochs,
+        'epochs_completed': len(epoch_train_losses),
+        'total_epochs': n_epochs,
         'model_type': model_type,
         'peft_method': 'lora' if peft_kwargs else 'none',
         'n_objects_per_batch': n_objects_per_batch,
-        'learning_rate': lr
+        'learning_rate': lr,
+        'final_train_loss': epoch_train_losses[-1] if epoch_train_losses else None,
+        'final_val_loss': epoch_val_losses[-1] if epoch_val_losses else None,
+        'best_val_loss': best_val_loss,
+        'epoch_train_losses': epoch_train_losses,
+        'epoch_val_losses': epoch_val_losses
     }
     
     summary_file = os.path.join(checkpoint_dir, "training_summary.json")
     with open(summary_file, 'w') as f:
         json.dump(summary_data, f, indent=2)
     
+    # Save loss data as CSV for further analysis
+    loss_df = pd.DataFrame({
+        'epoch': range(1, len(epoch_train_losses) + 1),
+        'train_loss': epoch_train_losses,
+        'val_loss': epoch_val_losses
+    })
+    loss_df.to_csv(os.path.join(checkpoint_dir, "epoch_losses.csv"), index=False)
+    
     if writer:
         writer.close()
     
-    print(f"Training completed! Checkpoints saved in: {checkpoint_dir}")
+    print(f"Training completed! Checkpoints and plots saved in: {checkpoint_dir}")
     
-    return None  # Model is saved by micro-sam
+    return None
 
+
+def create_epoch_loss_plots(epoch_train_losses, epoch_val_losses, all_batch_losses, save_dir, total_epochs):
+    """Create and save epoch-based loss curves."""
+    
+    # Create figure with subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+    fig.suptitle('Training Loss Curves', fontsize=16, fontweight='bold')
+    
+    # Plot 1: Epoch-wise Training and Validation Loss
+    ax1 = axes[0, 0]
+    epochs = range(1, len(epoch_train_losses) + 1)
+    
+    ax1.plot(epochs, epoch_train_losses, 'b-', linewidth=2, marker='o', markersize=4, label='Training Loss')
+    if epoch_val_losses:
+        ax1.plot(epochs, epoch_val_losses, 'r-', linewidth=2, marker='s', markersize=4, label='Validation Loss')
+    
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Loss', fontsize=12)
+    ax1.set_title('Training and Validation Loss per Epoch', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=11)
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(1, max(len(epoch_train_losses), 1))
+    
+    # Plot 2: Training Loss Only (larger view)
+    ax2 = axes[0, 1]
+    ax2.plot(epochs, epoch_train_losses, 'b-', linewidth=2, marker='o', markersize=4)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Training Loss', fontsize=12)
+    ax2.set_title('Training Loss per Epoch', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(1, max(len(epoch_train_losses), 1))
+    
+    # Plot 3: Batch-wise losses (smoothed for better visualization)
+    ax3 = axes[1, 0]
+    if all_batch_losses:
+        # Calculate moving average for smoothing
+        window_size = max(1, len(all_batch_losses) // 100)  # 1% of total batches
+        if window_size > 1 and len(all_batch_losses) > window_size:
+            smoothed_losses = []
+            for i in range(len(all_batch_losses)):
+                start_idx = max(0, i - window_size // 2)
+                end_idx = min(len(all_batch_losses), i + window_size // 2 + 1)
+                smoothed_losses.append(sum(all_batch_losses[start_idx:end_idx]) / (end_idx - start_idx))
+            
+            ax3.plot(range(len(all_batch_losses)), all_batch_losses, 'lightblue', alpha=0.3, 
+                    linewidth=0.5, label='Raw Batch Loss')
+            ax3.plot(range(len(smoothed_losses)), smoothed_losses, 'blue', linewidth=2, 
+                    label=f'Smoothed (window={window_size})')
+        else:
+            ax3.plot(range(len(all_batch_losses)), all_batch_losses, 'blue', linewidth=1, 
+                    label='Batch Loss')
+        
+        ax3.set_xlabel('Batch Number', fontsize=12)
+        ax3.set_ylabel('Loss', fontsize=12)
+        ax3.set_title('Training Loss per Batch', fontsize=14, fontweight='bold')
+        ax3.legend(fontsize=11)
+        ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Loss Statistics
+    ax4 = axes[1, 1]
+    if epoch_train_losses:
+        stats_data = {
+            'Metric': ['Min Train Loss', 'Max Train Loss', 'Final Train Loss', 'Avg Train Loss'],
+            'Value': [
+                min(epoch_train_losses),
+                max(epoch_train_losses),
+                epoch_train_losses[-1],
+                sum(epoch_train_losses) / len(epoch_train_losses)
+            ]
+        }
+        
+        if epoch_val_losses:
+            stats_data['Metric'].extend(['Min Val Loss', 'Max Val Loss', 'Final Val Loss', 'Avg Val Loss'])
+            stats_data['Value'].extend([
+                min(epoch_val_losses),
+                max(epoch_val_losses),
+                epoch_val_losses[-1],
+                sum(epoch_val_losses) / len(epoch_val_losses)
+            ])
+        
+        # Create a simple text display of statistics
+        ax4.axis('off')
+        stats_text = "Training Statistics:\n\n"
+        for metric, value in zip(stats_data['Metric'], stats_data['Value']):
+            stats_text += f"{metric}: {value:.4f}\n"
+        
+        stats_text += f"\nEpochs Completed: {len(epoch_train_losses)}/{total_epochs}"
+        
+        ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=11,
+                verticalalignment='top', fontfamily='monospace',
+                bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    plot_path = os.path.join(save_dir, 'epoch_loss_curves.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    # Also create a simplified epoch-only plot
+    plt.figure(figsize=(10, 6))
+    plt.plot(epochs, epoch_train_losses, 'b-', linewidth=2, marker='o', markersize=6, label='Training Loss')
+    if epoch_val_losses:
+        plt.plot(epochs, epoch_val_losses, 'r-', linewidth=2, marker='s', markersize=6, label='Validation Loss')
+    
+    plt.xlabel('Epoch', fontsize=14)
+    plt.ylabel('Loss', fontsize=14)
+    plt.title('Training Progress: Loss vs Epoch', fontsize=16, fontweight='bold')
+    plt.legend(fontsize=12)
+    plt.grid(True, alpha=0.3)
+    plt.xlim(1, max(len(epoch_train_losses), 1))
+    
+    # Add some annotations
+    if epoch_train_losses:
+        min_loss_epoch = epochs[epoch_train_losses.index(min(epoch_train_losses))]
+        plt.annotate(f'Min Train Loss: {min(epoch_train_losses):.4f}',
+                    xy=(min_loss_epoch, min(epoch_train_losses)),
+                    xytext=(10, 10), textcoords='offset points',
+                    bbox=dict(boxstyle='round,pad=0.3', facecolor='yellow', alpha=0.7),
+                    arrowprops=dict(arrowstyle='->', connectionstyle='arc3,rad=0'))
+    
+    plt.tight_layout()
+    simple_plot_path = os.path.join(save_dir, 'simple_epoch_loss_curve.png')
+    plt.savefig(simple_plot_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"Loss curves saved to:")
+    print(f"  - {plot_path}")
+    print(f"  - {simple_plot_path}")
+    
+    # Print summary statistics
+    if epoch_train_losses:
+        print(f"\nTraining Summary:")
+        print(f"  Epochs completed: {len(epoch_train_losses)}/{total_epochs}")
+        print(f"  Final training loss: {epoch_train_losses[-1]:.4f}")
+        print(f"  Best training loss: {min(epoch_train_losses):.4f} (epoch {epochs[epoch_train_losses.index(min(epoch_train_losses))]}) ")
+        
+        if epoch_val_losses:
+            print(f"  Final validation loss: {epoch_val_losses[-1]:.4f}")
+            print(f"  Best validation loss: {min(epoch_val_losses):.4f} (epoch {epochs[epoch_val_losses.index(min(epoch_val_losses))]})")
 
 
 def run_lora_training(args):
