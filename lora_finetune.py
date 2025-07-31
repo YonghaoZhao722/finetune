@@ -245,13 +245,13 @@ def run_lora_training(args):
         freeze_parts = None
         peft_kwargs = get_default_peft_kwargs(args.peft_method)
         
-        # Custom LoRA parameters (only rank is supported by micro-sam's LoRASurgery)
+        # Custom LoRA parameters
         if args.peft_method in ["lora", "qlora"]:
             if args.lora_rank is not None:
                 peft_kwargs["rank"] = args.lora_rank
-            # Note: lora_alpha and lora_dropout are not supported by micro-sam's LoRASurgery
             if args.lora_alpha is not None:
-                print(f"Warning: lora_alpha={args.lora_alpha} specified but not supported by micro-sam's LoRASurgery")
+                peft_kwargs["alpha"] = args.lora_alpha  # Use 'alpha' not 'lora_alpha'
+            # Note: lora_dropout is not supported by micro-sam's LoRASurgery
             if args.lora_dropout is not None:
                 print(f"Warning: lora_dropout={args.lora_dropout} specified but not supported by micro-sam's LoRASurgery")
         
