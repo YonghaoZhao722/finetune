@@ -11,7 +11,7 @@ from pathlib import Path
 import numpy as np
 from tifffile import imread, imwrite
 from scipy import ndimage
-from skimage.measure import label
+from skimage.measure import label, regionprops
 from sklearn.model_selection import train_test_split
 
 
@@ -54,10 +54,27 @@ def get_file_pairs(dic_folder, mask_folder):
     return sorted(list(common_files))
 
 
-def process_mask(mask_path):
+def analyze_instance_sizes(mask):
+    """
+    Analyze instance sizes in a mask.
+    Returns list of instance areas and other statistics.
+    """
+    if len(np.unique(mask)) <= 1:
+        # No instances found
+        return []
+    
+    # Get region properties
+    regions = regionprops(mask)
+    areas = [region.area for region in regions]
+    
+    return areas
+
+
+def process_mask(mask_path, min_instance_size=0):
     """
     Process mask to ensure proper instance segmentation format.
     Each object should have a unique ID, background should be 0.
+    Optionally filter out instances smaller than min_instance_size.
     """
     mask = imread(mask_path)
     
@@ -86,7 +103,121 @@ def process_mask(mask_path):
         if old_label != i:
             labeled_mask[labeled_mask == old_label] = i
     
+    # Apply instance size filtering if specified
+    if min_instance_size > 0:
+        filtered_mask, _ = filter_instances_by_size(labeled_mask, min_instance_size)
+        return filtered_mask
+    
     return labeled_mask.astype(np.uint16)
+
+
+def filter_instances_by_size(mask, min_instance_size):
+    """
+    Remove instances from mask that are smaller than minimum size.
+    Returns filtered mask and filtering statistics.
+    """
+    if len(np.unique(mask)) <= 1:
+        # No instances found
+        return mask, {'removed_count': 0, 'kept_count': 0, 'removed_areas': [], 'kept_areas': []}
+    
+    # Get region properties
+    regions = regionprops(mask)
+    
+    # Create new mask with only valid instances
+    filtered_mask = np.zeros_like(mask)
+    new_label = 1
+    removed_areas = []
+    kept_areas = []
+    
+    for region in regions:
+        if region.area >= min_instance_size:
+            # Keep this instance with new consecutive label
+            filtered_mask[mask == region.label] = new_label
+            kept_areas.append(region.area)
+            new_label += 1
+        else:
+            # Remove this instance
+            removed_areas.append(region.area)
+    
+    stats = {
+        'removed_count': len(removed_areas),
+        'kept_count': len(kept_areas),
+        'removed_areas': removed_areas,
+        'kept_areas': kept_areas
+    }
+    
+    return filtered_mask.astype(np.uint16), stats
+
+
+def analyze_and_filter_instances(file_pairs, mask_folder, min_instance_size):
+    """
+    Analyze instance sizes and return filtering statistics.
+    Returns tuple of (valid_pairs, filtering_info).
+    """
+    valid_pairs = []
+    filtering_info = []
+    
+    print(f"\nFiltering instances with minimum size: {min_instance_size} pixels")
+    print("=" * 60)
+    
+    for filename in file_pairs:
+        mask_path = os.path.join(mask_folder, filename)
+        if not os.path.exists(mask_path):
+            print(f"Warning: Mask not found for {filename}, skipping")
+            continue
+            
+        try:
+            # Load and process mask (without filtering first to get original stats)
+            original_mask = process_mask(mask_path, min_instance_size=0)
+            
+            # Analyze and filter instances
+            filtered_mask, stats = filter_instances_by_size(original_mask, min_instance_size)
+            
+            if stats['kept_count'] == 0:
+                # No valid instances remain
+                filtering_info.append({
+                    'filename': filename,
+                    'status': 'excluded',
+                    'original_count': stats['removed_count'],
+                    'kept_count': 0,
+                    'removed_count': stats['removed_count'],
+                    'removed_areas': stats['removed_areas'],
+                    'kept_areas': []
+                })
+                print(f"EXCLUDED: {filename} - All {stats['removed_count']} instances too small (areas: {stats['removed_areas']})")
+            else:
+                # Some instances remain
+                valid_pairs.append(filename)
+                filtering_info.append({
+                    'filename': filename,
+                    'status': 'kept',
+                    'original_count': stats['kept_count'] + stats['removed_count'],
+                    'kept_count': stats['kept_count'],
+                    'removed_count': stats['removed_count'],
+                    'removed_areas': stats['removed_areas'],
+                    'kept_areas': stats['kept_areas']
+                })
+                
+                if stats['removed_count'] > 0:
+                    print(f"MODIFIED: {filename} - Kept {stats['kept_count']}/{stats['kept_count'] + stats['removed_count']} instances, "
+                          f"removed {stats['removed_count']} small instances")
+                else:
+                    print(f"KEPT: {filename} - All {stats['kept_count']} instances valid")
+                
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+            filtering_info.append({
+                'filename': filename,
+                'status': 'error',
+                'original_count': 0,
+                'kept_count': 0,
+                'removed_count': 0,
+                'removed_areas': [],
+                'kept_areas': [],
+                'error': str(e)
+            })
+    
+    return valid_pairs, filtering_info
 
 
 def normalize_16bit_to_8bit(image, percentile_normalization=True, lower_percentile=1, upper_percentile=99):
@@ -135,7 +266,7 @@ def normalize_16bit_to_8bit(image, percentile_normalization=True, lower_percenti
 
 
 def copy_and_process_data(file_pairs, dic_folder, mask_folder, output_folder, split_name, 
-                         percentile_norm=True, lower_perc=1, upper_perc=99):
+                         percentile_norm=True, lower_perc=1, upper_perc=99, min_instance_size=0):
     """Copy and process data files to output folder."""
     output_dic = os.path.join(output_folder, split_name, 'images')
     output_mask = os.path.join(output_folder, split_name, 'masks')
@@ -172,7 +303,7 @@ def copy_and_process_data(file_pairs, dic_folder, mask_folder, output_folder, sp
                 # Process mask
                 mask_path = os.path.join(mask_folder, filename)
                 if os.path.exists(mask_path):
-                    processed_mask = process_mask(mask_path)
+                    processed_mask = process_mask(mask_path, min_instance_size)
                     
                     # Save processed mask
                     output_mask_path = os.path.join(output_mask, filename)
@@ -231,6 +362,10 @@ def main():
     parser.add_argument("--upper_percentile", type=float, default=99.0,
                       help="Upper percentile for clipping (default: 99.0)")
     
+    # Instance size filtering
+    parser.add_argument("--min_instance_size", type=int, default=0,
+                      help="Minimum instance size in pixels (default: 0, no filtering)")
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -255,6 +390,7 @@ def main():
     print(f"  Normalization: {'Percentile' if args.percentile_normalization else 'Min-Max'}")
     if args.percentile_normalization:
         print(f"  Percentile range: {args.lower_percentile}% - {args.upper_percentile}%")
+    print(f"  Minimum instance size: {args.min_instance_size} pixels")
     
     # Get file pairs
     file_pairs = get_file_pairs(args.dic_folder, args.mask_folder)
@@ -263,12 +399,27 @@ def main():
         print("Error: No matching file pairs found!")
         return
     
+    # Apply instance size filtering if specified
+    filtering_info = []
+    if args.min_instance_size > 0:
+        file_pairs, filtering_info = analyze_and_filter_instances(
+            file_pairs, args.mask_folder, args.min_instance_size
+        )
+        
+        if len(file_pairs) == 0:
+            print("Error: No files remain after filtering!")
+            return
+    
     # Split data
     train_files, val_files = create_data_split(
         file_pairs, args.train_ratio, args.val_ratio, args.random_state
     )
     
     print(f"\nData split:")
+    if args.min_instance_size > 0:
+        excluded_count = len([info for info in filtering_info if info['status'] == 'excluded'])
+        print(f"  Files after filtering: {len(file_pairs)}")
+        print(f"  Files excluded: {excluded_count}")
     print(f"  Training: {len(train_files)} files")
     print(f"  Validation: {len(val_files)} files")
     
@@ -281,7 +432,8 @@ def main():
         train_files, args.dic_folder, args.mask_folder, args.output_folder, 'train',
         percentile_norm=args.percentile_normalization,
         lower_perc=args.lower_percentile,
-        upper_perc=args.upper_percentile
+        upper_perc=args.upper_percentile,
+        min_instance_size=args.min_instance_size
     )
     
     # Process validation data
@@ -290,13 +442,49 @@ def main():
         val_files, args.dic_folder, args.mask_folder, args.output_folder, 'val',
         percentile_norm=args.percentile_normalization,
         lower_perc=args.lower_percentile,
-        upper_perc=args.upper_percentile
+        upper_perc=args.upper_percentile,
+        min_instance_size=args.min_instance_size
     )
     
     print(f"\nData preprocessing complete!")
     print(f"  Processed {train_count} training samples")
     print(f"  Processed {val_count} validation samples")
     print(f"  Output directory: {args.output_folder}")
+    
+    # Report filtering results
+    if args.min_instance_size > 0 and filtering_info:
+        print(f"\nFiltering Summary:")
+        print(f"  Minimum instance size: {args.min_instance_size} pixels")
+        
+        excluded_files = [info for info in filtering_info if info['status'] == 'excluded']
+        modified_files = [info for info in filtering_info if info['status'] == 'kept' and info['removed_count'] > 0]
+        kept_files = [info for info in filtering_info if info['status'] == 'kept' and info['removed_count'] == 0]
+        
+        print(f"  Files completely excluded: {len(excluded_files)}")
+        print(f"  Files with instances removed: {len(modified_files)}")
+        print(f"  Files kept unchanged: {len(kept_files)}")
+        
+        if excluded_files:
+            print(f"\nCompletely excluded files:")
+            print("=" * 80)
+            for info in excluded_files:
+                print(f"  {info['filename']}")
+                print(f"    Original instances: {info['original_count']}")
+                print(f"    All instance areas: {info['removed_areas']}")
+                print()
+        
+        if modified_files:
+            print(f"\nFiles with instances removed:")
+            print("=" * 80)
+            for info in modified_files:
+                print(f"  {info['filename']}")
+                print(f"    Original instances: {info['original_count']}")
+                print(f"    Kept instances: {info['kept_count']}")
+                print(f"    Removed instances: {info['removed_count']}")
+                print(f"    Removed areas: {info['removed_areas']}")
+                print(f"    Kept areas: {info['kept_areas']}")
+                print()
+    
     print(f"\nDirectory structure:")
     print(f"  {args.output_folder}/")
     print(f"  ├── train/")
