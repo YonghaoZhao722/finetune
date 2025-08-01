@@ -15,6 +15,9 @@ import matplotlib.pyplot as plt
 from collections import defaultdict
 import json
 import pandas as pd
+import numpy as np
+import traceback
+from tifffile import imread, imwrite
 
 import micro_sam.training as sam_training
 from micro_sam.util import export_custom_sam_model
@@ -28,7 +31,239 @@ except ImportError:
     TENSORBOARD_AVAILABLE = False
 
 
-def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_segmentation):
+class DebugMinInstanceSampler(MinInstanceSampler):
+    """MinInstanceSampler with debugging capabilities to handle empty patches from 512x512 cropping"""
+    
+    def __init__(self, debug_dir="./debug_empty_masks", max_retries=10, **kwargs):
+        super().__init__(**kwargs)
+        self.debug_dir = debug_dir
+        self.empty_patch_count = 0
+        self.total_attempts = 0
+        self.max_retries = max_retries
+        os.makedirs(debug_dir, exist_ok=True)
+        print(f"DebugMinInstanceSampler initialized - will retry up to {max_retries} times for empty patches")
+        
+    def __call__(self, dataset, index):
+        self.total_attempts += 1
+        
+        for retry in range(self.max_retries):
+            try:
+                # Try the original sampling
+                result = super().__call__(dataset, index)
+                
+                # Log success rate periodically
+                if self.total_attempts % 100 == 0:
+                    success_rate = ((self.total_attempts - self.empty_patch_count) / self.total_attempts) * 100
+                    print(f"Sampling stats: {self.empty_patch_count} empty patches out of {self.total_attempts} attempts ({success_rate:.1f}% success rate)")
+                
+                return result
+                
+            except Exception as e:
+                if "No foreground objects were found" in str(e) or "no instances" in str(e).lower():
+                    self.empty_patch_count += 1
+                    
+                    if retry == 0:  # Only print on first retry
+                        print(f"Empty patch detected during 512x512 cropping (total: {self.empty_patch_count}), trying alternative sampling...")
+                    
+                    # Try different approach for finding valid patches
+                    if retry < self.max_retries - 1:
+                        # Try nearby indices
+                        alt_index = self._find_valid_sample_nearby(dataset, index, max_offset=retry+1)
+                        if alt_index is not None:
+                            index = alt_index  # Use alternative index for next retry
+                            continue
+                        
+                        # Try random index if nearby search fails
+                        import random
+                        index = random.randint(0, len(dataset) - 1)
+                        continue
+                    else:
+                        # Last retry failed, save debug info and raise error
+                        print(f"Failed to find valid patch after {self.max_retries} retries")
+                        self._save_debug_info(dataset, index, e)
+                        raise e
+                else:
+                    # Re-raise other types of errors immediately
+                    raise e
+        
+        # Should not reach here
+        raise RuntimeError("Unexpected sampling failure")
+    
+    def _save_debug_info(self, dataset, index, error):
+        """Save the problematic image and mask for debugging"""
+        try:
+            # Get the raw sample without any transforms
+            sample = dataset._get_sample(index)
+            raw_image, raw_mask = sample
+            
+            # Convert to numpy if needed
+            if hasattr(raw_image, 'numpy'):
+                raw_image = raw_image.numpy()
+            if hasattr(raw_mask, 'numpy'):
+                raw_mask = raw_mask.numpy()
+            
+            # Save files with timestamp and index
+            timestamp = int(time.time())
+            debug_prefix = f"empty_mask_{timestamp}_idx{index}"
+            
+            # Save image
+            image_path = os.path.join(self.debug_dir, f"{debug_prefix}_image.tif")
+            if raw_image.ndim == 3 and raw_image.shape[0] == 1:
+                raw_image = raw_image[0]  # Remove channel dimension for saving
+            imwrite(image_path, raw_image.astype(np.uint8))
+            
+            # Save mask
+            mask_path = os.path.join(self.debug_dir, f"{debug_prefix}_mask.tif")
+            if raw_mask.ndim == 3 and raw_mask.shape[0] == 1:
+                raw_mask = raw_mask[0]  # Remove channel dimension for saving
+            imwrite(mask_path, raw_mask.astype(np.uint16))
+            
+            # Save debug info
+            info_path = os.path.join(self.debug_dir, f"{debug_prefix}_info.txt")
+            with open(info_path, 'w') as f:
+                f.write(f"Debug Info for Empty Mask\n")
+                f.write(f"========================\n")
+                f.write(f"Index: {index}\n")
+                f.write(f"Error: {error}\n")
+                f.write(f"Image shape: {raw_image.shape}\n")
+                f.write(f"Mask shape: {raw_mask.shape}\n")
+                f.write(f"Mask unique values: {np.unique(raw_mask)}\n")
+                f.write(f"Mask max value: {np.max(raw_mask)}\n")
+                f.write(f"Mask sum: {np.sum(raw_mask > 0)}\n")
+                f.write(f"Traceback:\n{traceback.format_exc()}\n")
+            
+            print(f"DEBUG: Saved debug files with prefix {debug_prefix}")
+            
+        except Exception as save_error:
+            print(f"DEBUG: Error saving debug info: {save_error}")
+    
+    def _find_valid_sample_nearby(self, dataset, original_index, max_offset=5):
+        """Try to find a valid sample by checking nearby indices"""
+        dataset_len = len(dataset)
+        
+        for offset in range(1, min(max_offset, dataset_len)):
+            # Try both forward and backward
+            for direction in [1, -1]:
+                test_index = (original_index + direction * offset) % dataset_len
+                try:
+                    # Quick check if this sample might be valid
+                    sample = dataset._get_sample(test_index)
+                    raw_image, raw_mask = sample
+                    
+                    # Check if mask has any foreground objects
+                    if hasattr(raw_mask, 'numpy'):
+                        mask_array = raw_mask.numpy()
+                    else:
+                        mask_array = raw_mask
+                    
+                    if np.any(mask_array > 0):
+                        # This sample looks valid, return the index
+                        return test_index
+                except:
+                    continue
+        
+        return None
+
+
+def validate_dataset(data_folder, split):
+    """Validate dataset and report issues with empty masks."""
+    image_dir = os.path.join(data_folder, split, 'images')
+    mask_dir = os.path.join(data_folder, split, 'masks')
+    
+    import glob
+    from tifffile import imread
+    
+    image_files = sorted(glob.glob(os.path.join(image_dir, '*.tif')))
+    mask_files = sorted(glob.glob(os.path.join(mask_dir, '*.tif')))
+    
+    print(f"\nValidating {split} dataset...")
+    print(f"Found {len(image_files)} images and {len(mask_files)} masks")
+    
+    empty_masks = []
+    valid_pairs = []
+    
+    for i, (img_file, mask_file) in enumerate(zip(image_files, mask_files)):
+        try:
+            mask = imread(mask_file)
+            if np.sum(mask > 0) == 0:
+                empty_masks.append((i, mask_file))
+                print(f"WARNING: Empty mask found: {mask_file}")
+            else:
+                valid_pairs.append((img_file, mask_file))
+        except Exception as e:
+            print(f"ERROR reading {mask_file}: {e}")
+            empty_masks.append((i, mask_file))
+    
+    print(f"Validation results:")
+    print(f"  Valid pairs: {len(valid_pairs)}")
+    print(f"  Empty/invalid masks: {len(empty_masks)}")
+    
+    if len(empty_masks) > 0:
+        print(f"WARNING: Found {len(empty_masks)} empty or invalid masks!")
+        print("Consider removing these files or check your data preprocessing.")
+        
+        # Save list of problematic files
+        problem_file = os.path.join(data_folder, f"{split}_empty_masks.txt")
+        with open(problem_file, 'w') as f:
+            f.write(f"Empty masks found in {split} dataset:\n")
+            for idx, mask_file in empty_masks:
+                f.write(f"{idx}: {mask_file}\n")
+        print(f"List saved to: {problem_file}")
+    
+    return len(valid_pairs), len(empty_masks)
+
+
+def clean_empty_masks(data_folder, split, backup=True):
+    """Remove empty mask files and their corresponding images."""
+    image_dir = os.path.join(data_folder, split, 'images')
+    mask_dir = os.path.join(data_folder, split, 'masks')
+    
+    import glob
+    import shutil
+    from tifffile import imread
+    
+    image_files = sorted(glob.glob(os.path.join(image_dir, '*.tif')))
+    mask_files = sorted(glob.glob(os.path.join(mask_dir, '*.tif')))
+    
+    if backup:
+        backup_dir = os.path.join(data_folder, f"{split}_backup_empty_masks")
+        os.makedirs(backup_dir, exist_ok=True)
+        backup_img_dir = os.path.join(backup_dir, 'images')
+        backup_mask_dir = os.path.join(backup_dir, 'masks')
+        os.makedirs(backup_img_dir, exist_ok=True)
+        os.makedirs(backup_mask_dir, exist_ok=True)
+    
+    removed_count = 0
+    
+    for img_file, mask_file in zip(image_files, mask_files):
+        try:
+            mask = imread(mask_file)
+            if np.sum(mask > 0) == 0:
+                print(f"Removing empty mask: {mask_file}")
+                
+                if backup:
+                    # Move to backup directory
+                    img_backup = os.path.join(backup_img_dir, os.path.basename(img_file))
+                    mask_backup = os.path.join(backup_mask_dir, os.path.basename(mask_file))
+                    shutil.move(img_file, img_backup)
+                    shutil.move(mask_file, mask_backup)
+                else:
+                    # Delete files
+                    os.remove(img_file)
+                    os.remove(mask_file)
+                
+                removed_count += 1
+        except Exception as e:
+            print(f"Error processing {mask_file}: {e}")
+    
+    print(f"Removed {removed_count} empty mask pairs from {split} dataset")
+    if backup and removed_count > 0:
+        print(f"Backup saved to: {backup_dir}")
+    
+    return removed_count
+
+
+def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_segmentation, debug_empty_masks=True, empty_patch_retries=10):
     """Return train or val data loader for finetuning SAM."""
     assert split in ("train", "val")
     
@@ -46,16 +281,25 @@ def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_s
     
     if train_instance_segmentation:
         # Use PerObjectDistanceTransform for automatic instance segmentation
+        # NOTE: Reduce min_size to avoid conflicts with your preprocessing
         label_transform = PerObjectDistanceTransform(
             distances=True, 
             boundary_distances=True, 
             directed_distances=False,
             foreground=True, 
             instances=True, 
-            min_size=25
+            min_size=0  # Reduced from 25 to avoid double filtering
         )
     else:
         label_transform = torch_em.transform.label.connected_components
+    
+    # Use debug sampler if requested - this handles empty patches created during 512x512 cropping
+    if train_instance_segmentation and debug_empty_masks:
+        debug_dir = os.path.join("./debug_empty_masks", split)
+        sampler = DebugMinInstanceSampler(debug_dir=debug_dir, max_retries=empty_patch_retries)
+        print(f"Using DebugMinInstanceSampler for {split} - this will handle empty patches from 512x512 cropping with {empty_patch_retries} retries")
+    else:
+        sampler = MinInstanceSampler() if train_instance_segmentation else None
     
     loader = torch_em.default_segmentation_loader(
         raw_paths=image_dir, 
@@ -68,8 +312,8 @@ def get_dataloader(data_folder, split, patch_shape, batch_size, train_instance_s
         is_seg_dataset=True,
         label_transform=label_transform,
         raw_transform=sam_training.identity,
-        sampler=MinInstanceSampler() if train_instance_segmentation else None,
-        num_workers=8, 
+        sampler=sampler,
+        num_workers=0,  # Set to 0 to avoid multiprocessing issues
         shuffle=True
     )
     
@@ -474,17 +718,59 @@ def run_normal_training(args):
     
     print(f"Checkpoint will be saved as: {checkpoint_name}")
     
+    # Validate data before loading
+    print("Validating dataset...")
+    train_valid, train_empty = validate_dataset(args.data_folder, "train")
+    val_valid, val_empty = validate_dataset(args.data_folder, "val")
+    
+    if train_empty > 0 or val_empty > 0:
+        print(f"\nWARNING: Found empty masks in your dataset!")
+        print(f"Training: {train_empty} empty masks out of {train_valid + train_empty}")
+        print(f"Validation: {val_empty} empty masks out of {val_valid + val_empty}")
+        print("This may cause training issues.")
+        
+        print("\nOptions:")
+        print("1. Clean the data automatically (recommended)")
+        print("2. Continue training anyway (may fail)")
+        print("3. Abort training")
+        
+        response = input("Choose option (1/2/3): ").strip()
+        
+        if response == '1':
+            print("Cleaning empty masks...")
+            if train_empty > 0:
+                removed_train = clean_empty_masks(args.data_folder, "train", backup=True)
+                print(f"Removed {removed_train} empty training masks")
+            if val_empty > 0:
+                removed_val = clean_empty_masks(args.data_folder, "val", backup=True)
+                print(f"Removed {removed_val} empty validation masks")
+            print("Data cleaned! Continuing with training...")
+        elif response == '2':
+            print("Continuing with potentially problematic data...")
+        else:
+            print("Training aborted. Please clean your data and try again.")
+            return
+    
     # Get data loaders
     print("Loading data...")
+    debug_empty_masks = not args.disable_debug_sampler
     train_loader = get_dataloader(
-        args.data_folder, "train", patch_shape, args.batch_size, args.train_instance_segmentation
+        args.data_folder, "train", patch_shape, args.batch_size, args.train_instance_segmentation,
+        debug_empty_masks=debug_empty_masks, empty_patch_retries=args.empty_patch_retries
     )
     val_loader = get_dataloader(
-        args.data_folder, "val", patch_shape, args.batch_size, args.train_instance_segmentation
+        args.data_folder, "val", patch_shape, args.batch_size, args.train_instance_segmentation,
+        debug_empty_masks=debug_empty_masks, empty_patch_retries=args.empty_patch_retries
     )
     
     print(f"Training samples: {len(train_loader.dataset)}")
     print(f"Validation samples: {len(val_loader.dataset)}")
+    
+    # Reduce n_objects_per_batch if using debug sampler to improve success rate
+    if hasattr(train_loader.sampler, 'empty_patch_count'):
+        original_n_objects = args.n_objects_per_batch
+        args.n_objects_per_batch = max(5, args.n_objects_per_batch // 2)
+        print(f"Reduced n_objects_per_batch from {original_n_objects} to {args.n_objects_per_batch} to handle potential empty patches from 512x512 cropping")
     
     # Run training with custom loss tracking
     print("Starting training...")
@@ -561,6 +847,16 @@ def main():
     parser.add_argument("--log_dir", type=str, default="./logs",
                       help="Directory for logging and tensorboard files")
     
+    # Data validation arguments
+    parser.add_argument("--validate_only", action="store_true",
+                      help="Only validate dataset without training")
+    parser.add_argument("--clean_data", action="store_true",
+                      help="Clean empty masks from dataset")
+    parser.add_argument("--empty_patch_retries", type=int, default=10,
+                      help="Number of retries for empty patches during 512x512 cropping")
+    parser.add_argument("--disable_debug_sampler", action="store_true",
+                      help="Disable debug sampler (may cause crashes with empty patches)")
+    
     args = parser.parse_args()
     
     # Validate arguments
@@ -590,7 +886,29 @@ def main():
     print(f"Objects per batch: {args.n_objects_per_batch}")
     print(f"Instance segmentation: {args.train_instance_segmentation}")
     print(f"Log directory: {args.log_dir}")
+    print(f"Empty patch handling: {'enabled' if not args.disable_debug_sampler else 'disabled'}")
+    if not args.disable_debug_sampler:
+        print(f"Empty patch retries: {args.empty_patch_retries}")
     print("="*60)
+    
+    # Handle validation and cleaning options
+    if args.validate_only:
+        print("Validating dataset only...")
+        train_valid, train_empty = validate_dataset(args.data_folder, "train")
+        val_valid, val_empty = validate_dataset(args.data_folder, "val")
+        print(f"\nSummary:")
+        print(f"Training: {train_valid} valid, {train_empty} empty")
+        print(f"Validation: {val_valid} valid, {val_empty} empty")
+        return
+    
+    if args.clean_data:
+        print("Cleaning dataset...")
+        train_removed = clean_empty_masks(args.data_folder, "train", backup=True)
+        val_removed = clean_empty_masks(args.data_folder, "val", backup=True)
+        print(f"Cleaned {train_removed} training and {val_removed} validation empty masks")
+        if not args.validate_only:
+            print("Data cleaned! You can now run training.")
+        return
     
     # Run training
     run_normal_training(args)
