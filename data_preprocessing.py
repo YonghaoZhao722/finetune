@@ -322,6 +322,75 @@ def copy_and_process_data(file_pairs, dic_folder, mask_folder, output_folder, sp
     return processed_count
 
 
+def create_microsam_structure(file_pairs, dic_folder, mask_folder, output_folder,
+                             percentile_norm=True, lower_perc=1, upper_perc=99, min_instance_size=0):
+    """
+    Create micro_sam compatible folder structure for direct use with finetune_hela.py.
+    
+    """
+    # Create micro_sam compatible paths
+    images_output_dir = os.path.join(output_folder, "DIC")
+    masks_output_dir = os.path.join(output_folder, "DIC_mask")
+    
+    os.makedirs(images_output_dir, exist_ok=True)
+    os.makedirs(masks_output_dir, exist_ok=True)
+    
+    processed_count = 0
+    
+    print(f"Creating micro_sam compatible structure:")
+    print(f"  Images will be saved to: {images_output_dir}")
+    print(f"  Masks will be saved to: {masks_output_dir}")
+    print(f"  Files will be renamed to t000.tif, t001.tif, etc.")
+    
+    for idx, filename in enumerate(file_pairs):
+        try:
+            # Generate micro_sam compatible filename (t000.tif, t001.tif, etc.)
+            new_filename = f"t{str(idx).zfill(3)}.tif"
+            
+            # Process DIC image
+            dic_path = os.path.join(dic_folder, filename)
+            if os.path.exists(dic_path):
+                dic_image = imread(dic_path)
+                
+                print(f"Processing {filename} -> {new_filename}: Original dtype={dic_image.dtype}, shape={dic_image.shape}, "
+                      f"range=[{dic_image.min()}, {dic_image.max()}]")
+                
+                # Normalize 16-bit images to 8-bit [0, 255] range
+                dic_image = normalize_16bit_to_8bit(
+                    dic_image, 
+                    percentile_normalization=percentile_norm,
+                    lower_percentile=lower_perc,
+                    upper_percentile=upper_perc
+                )
+                
+                print(f"  -> Normalized: dtype={dic_image.dtype}, range=[{dic_image.min()}, {dic_image.max()}]")
+                
+                # Save DIC image with micro_sam naming
+                output_image_path = os.path.join(images_output_dir, new_filename)
+                imwrite(output_image_path, dic_image)
+                
+                # Process mask
+                mask_path = os.path.join(mask_folder, filename)
+                if os.path.exists(mask_path):
+                    processed_mask = process_mask(mask_path, min_instance_size)
+                    
+                    # Save processed mask with micro_sam naming
+                    output_mask_path = os.path.join(masks_output_dir, new_filename)
+                    imwrite(output_mask_path, processed_mask)
+                    
+                    processed_count += 1
+                    print(f"Processed {processed_count}: {filename} -> {new_filename}")
+                else:
+                    print(f"Warning: Mask not found for {filename}")
+            else:
+                print(f"Warning: DIC image not found for {filename}")
+                
+        except Exception as e:
+            print(f"Error processing {filename}: {e}")
+    
+    return processed_count
+
+
 def create_data_split(file_pairs, train_ratio=0.8, val_ratio=0.2, random_state=42):
     """Split data into train and validation sets."""
     if train_ratio + val_ratio != 1.0:
@@ -336,8 +405,110 @@ def create_data_split(file_pairs, train_ratio=0.8, val_ratio=0.2, random_state=4
     return train_files, val_files
 
 
+def detect_microsam_structure(data_folder):
+    """
+    Detect and resolve the micro_sam official download structure.
+    
+    Expected structure:
+    - Images: data_folder/DIC-C2DH-HeLa.zip.unzip/DIC-C2DH-HeLa/01/
+    - Masks: data_folder/hela-ctc-01-gt.zip.unzip/masks/
+    
+    Returns:
+        tuple: (dic_folder, mask_folder) or (None, None) if not found
+    """
+    data_path = Path(data_folder)
+    
+    # Look for the image folder
+    dic_candidates = [
+        data_path / "DIC-C2DH-HeLa.zip.unzip" / "DIC-C2DH-HeLa" / "01",
+        data_path / "DIC-C2DH-HeLa.zip.unzip" / "DIC-C2DH-HeLa" / "01_RES",
+        data_path / "DIC-C2DH-HeLa.zip.unzip" / "DIC-C2DH-HeLa" / "01_GT" / "SEG",
+    ]
+    
+    # Look for the mask folder  
+    mask_candidates = [
+        data_path / "hela-ctc-01-gt.zip.unzip" / "masks",
+        data_path / "DIC-C2DH-HeLa.zip.unzip" / "DIC-C2DH-HeLa" / "01_GT" / "SEG",
+        data_path / "DIC-C2DH-HeLa.zip.unzip" / "DIC-C2DH-HeLa" / "01_ST" / "SEG",
+    ]
+    
+    dic_folder = None
+    mask_folder = None
+    
+    # Find existing DIC folder
+    for candidate in dic_candidates:
+        if candidate.exists() and candidate.is_dir():
+            # Check if it contains .tif files
+            tif_files = list(candidate.glob("*.tif")) + list(candidate.glob("*.tiff"))
+            if tif_files:
+                dic_folder = str(candidate)
+                print(f"Found DIC images in: {dic_folder}")
+                print(f"  Contains {len(tif_files)} .tif files")
+                break
+    
+    # Find existing mask folder
+    for candidate in mask_candidates:
+        if candidate.exists() and candidate.is_dir():
+            # Check if it contains .tif files
+            tif_files = list(candidate.glob("*.tif")) + list(candidate.glob("*.tiff"))
+            if tif_files:
+                mask_folder = str(candidate)
+                print(f"Found mask images in: {mask_folder}")
+                print(f"  Contains {len(tif_files)} .tif files")
+                break
+    
+    return dic_folder, mask_folder
+
+
+def resolve_paths(dic_folder, mask_folder, data_folder, use_microsam_data):
+    """
+    Resolve the actual paths for DIC and mask folders.
+    
+    Args:
+        dic_folder: User-specified DIC folder (or None)
+        mask_folder: User-specified mask folder (or None)
+        data_folder: Base data folder
+        use_microsam_data: Whether to auto-detect micro_sam structure
+    
+    Returns:
+        tuple: (resolved_dic_folder, resolved_mask_folder)
+    """
+    resolved_dic = dic_folder
+    resolved_mask = mask_folder
+    
+    if use_microsam_data:
+        print("Auto-detecting micro_sam download structure...")
+        detected_dic, detected_mask = detect_microsam_structure(data_folder)
+        
+        if detected_dic and not resolved_dic:
+            resolved_dic = detected_dic
+            print(f"Using auto-detected DIC folder: {resolved_dic}")
+        
+        if detected_mask and not resolved_mask:
+            resolved_mask = detected_mask  
+            print(f"Using auto-detected mask folder: {resolved_mask}")
+        
+        if not detected_dic and not detected_mask:
+            print("Warning: Could not auto-detect micro_sam structure")
+            print("Expected structure:")
+            print(f"  - Images: {data_folder}/DIC-C2DH-HeLa.zip.unzip/DIC-C2DH-HeLa/01/")
+            print(f"  - Masks: {data_folder}/hela-ctc-01-gt.zip.unzip/masks/")
+            print("Please specify --dic_folder and --mask_folder manually.")
+    
+    return resolved_dic, resolved_mask
+
+
 def main():
     parser = argparse.ArgumentParser(description="Preprocess DIC and mask data for SAM fine-tuning")
+    
+    # Data source options
+    parser.add_argument("--use_microsam_data", action="store_true", 
+                      help="Auto-detect and use micro_sam official download structure")
+    parser.add_argument("--create_microsam_structure", action="store_true",
+                      help="Create output in micro_sam compatible structure (for use with finetune_hela.py)")
+    parser.add_argument("--data_folder", type=str, default="processed_data",
+                      help="Base folder containing downloaded data (used with --use_microsam_data)")
+    
     parser.add_argument("--dic_folder", type=str, default="DIC", 
                       help="Path to DIC images folder")
     parser.add_argument("--mask_folder", type=str, default="DIC_mask", 
@@ -373,27 +544,52 @@ def main():
         print("Error: train_ratio + val_ratio must equal 1.0")
         return
     
-    # Check input folders exist
-    if not os.path.exists(args.dic_folder):
-        print(f"Error: DIC folder '{args.dic_folder}' does not exist")
+    # Resolve input folder paths
+    dic_folder, mask_folder = resolve_paths(
+        args.dic_folder, args.mask_folder, args.data_folder, args.use_microsam_data
+    )
+    
+    # Validate that we have resolved paths
+    if not dic_folder and not mask_folder:
+        print("Error: Could not determine DIC and mask folders")
+        if args.use_microsam_data:
+            print("Ensure you have downloaded data using micro_sam, or specify paths manually")
+        else:
+            print("Please specify --dic_folder and --mask_folder")
         return
     
-    if not os.path.exists(args.mask_folder):
-        print(f"Error: Mask folder '{args.mask_folder}' does not exist")
+    if not dic_folder:
+        print("Error: Could not determine DIC folder")
+        print("Please specify --dic_folder manually")
+        return
+        
+    if not mask_folder:
+        print("Error: Could not determine mask folder") 
+        print("Please specify --mask_folder manually")
+        return
+    
+    # Check that resolved folders exist
+    if not os.path.exists(dic_folder):
+        print(f"Error: DIC folder '{dic_folder}' does not exist")
+        return
+    
+    if not os.path.exists(mask_folder):
+        print(f"Error: Mask folder '{mask_folder}' does not exist")
         return
     
     print(f"Processing data from:")
-    print(f"  DIC folder: {args.dic_folder}")
-    print(f"  Mask folder: {args.mask_folder}")
+    print(f"  DIC folder: {dic_folder}")
+    print(f"  Mask folder: {mask_folder}")
     print(f"  Output folder: {args.output_folder}")
     print(f"  Train/Val split: {args.train_ratio:.1f}/{args.val_ratio:.1f}")
     print(f"  Normalization: {'Percentile' if args.percentile_normalization else 'Min-Max'}")
     if args.percentile_normalization:
         print(f"  Percentile range: {args.lower_percentile}% - {args.upper_percentile}%")
     print(f"  Minimum instance size: {args.min_instance_size} pixels")
+    print(f"  Using micro_sam data: {args.use_microsam_data}")
     
     # Get file pairs
-    file_pairs = get_file_pairs(args.dic_folder, args.mask_folder)
+    file_pairs = get_file_pairs(dic_folder, mask_folder)
     
     if len(file_pairs) == 0:
         print("Error: No matching file pairs found!")
@@ -403,53 +599,94 @@ def main():
     filtering_info = []
     if args.min_instance_size > 0:
         file_pairs, filtering_info = analyze_and_filter_instances(
-            file_pairs, args.mask_folder, args.min_instance_size
+            file_pairs, mask_folder, args.min_instance_size
         )
         
         if len(file_pairs) == 0:
             print("Error: No files remain after filtering!")
             return
     
-    # Split data
-    train_files, val_files = create_data_split(
-        file_pairs, args.train_ratio, args.val_ratio, args.random_state
-    )
-    
-    print(f"\nData split:")
-    if args.min_instance_size > 0:
-        excluded_count = len([info for info in filtering_info if info['status'] == 'excluded'])
-        print(f"  Files after filtering: {len(file_pairs)}")
-        print(f"  Files excluded: {excluded_count}")
-    print(f"  Training: {len(train_files)} files")
-    print(f"  Validation: {len(val_files)} files")
-    
     # Create output directory structure
     os.makedirs(args.output_folder, exist_ok=True)
     
-    # Process training data
-    print(f"\nProcessing training data...")
-    train_count = copy_and_process_data(
-        train_files, args.dic_folder, args.mask_folder, args.output_folder, 'train',
-        percentile_norm=args.percentile_normalization,
-        lower_perc=args.lower_percentile,
-        upper_perc=args.upper_percentile,
-        min_instance_size=args.min_instance_size
-    )
-    
-    # Process validation data
-    print(f"\nProcessing validation data...")
-    val_count = copy_and_process_data(
-        val_files, args.dic_folder, args.mask_folder, args.output_folder, 'val',
-        percentile_norm=args.percentile_normalization,
-        lower_perc=args.lower_percentile,
-        upper_perc=args.upper_percentile,
-        min_instance_size=args.min_instance_size
-    )
-    
-    print(f"\nData preprocessing complete!")
-    print(f"  Processed {train_count} training samples")
-    print(f"  Processed {val_count} validation samples")
-    print(f"  Output directory: {args.output_folder}")
+    if args.create_microsam_structure:
+        # Create micro_sam compatible structure (no train/val split - handled by finetune_hela.py)
+        print(f"\nCreating micro_sam compatible structure...")
+        print(f"Note: Train/Val split will be handled automatically by finetune_hela.py using roi parameter")
+        print(f"Total files to process: {len(file_pairs)}")
+        
+        total_count = create_microsam_structure(
+            file_pairs, dic_folder, mask_folder, args.output_folder,
+            percentile_norm=args.percentile_normalization,
+            lower_perc=args.lower_percentile,
+            upper_perc=args.upper_percentile,
+            min_instance_size=args.min_instance_size
+        )
+        
+        print(f"\nData preprocessing complete!")
+        print(f"  Processed {total_count} samples in micro_sam format")
+        print(f"  Output directory: {args.output_folder}")
+        
+        print(f"\nCreated micro_sam compatible structure:")
+        print(f"  {args.output_folder}/")
+        print(f"  ├── DIC-C2DH-HeLa.zip.unzip/")
+        print(f"  │   └── DIC-C2DH-HeLa/")
+        print(f"  │       └── 01/              # Images (t000.tif, t001.tif, ...)")
+        print(f"  └── hela-ctc-01-gt.zip.unzip/")
+        print(f"      └── masks/               # Masks (t000.tif, t001.tif, ...)")
+        
+        print(f"\n🎉 Ready for training!")
+        print(f"  Now you can run: python finetune_hela.py")
+        print(f"  The script will automatically use the created data structure.")
+        
+    else:
+        # Traditional train/val split processing
+        # Split data
+        train_files, val_files = create_data_split(
+            file_pairs, args.train_ratio, args.val_ratio, args.random_state
+        )
+        
+        print(f"\nData split:")
+        if args.min_instance_size > 0:
+            excluded_count = len([info for info in filtering_info if info['status'] == 'excluded'])
+            print(f"  Files after filtering: {len(file_pairs)}")
+            print(f"  Files excluded: {excluded_count}")
+        print(f"  Training: {len(train_files)} files")
+        print(f"  Validation: {len(val_files)} files")
+        
+        # Process training data
+        print(f"\nProcessing training data...")
+        train_count = copy_and_process_data(
+            train_files, dic_folder, mask_folder, args.output_folder, 'train',
+            percentile_norm=args.percentile_normalization,
+            lower_perc=args.lower_percentile,
+            upper_perc=args.upper_percentile,
+            min_instance_size=args.min_instance_size
+        )
+        
+        # Process validation data
+        print(f"\nProcessing validation data...")
+        val_count = copy_and_process_data(
+            val_files, dic_folder, mask_folder, args.output_folder, 'val',
+            percentile_norm=args.percentile_normalization,
+            lower_perc=args.lower_percentile,
+            upper_perc=args.upper_percentile,
+            min_instance_size=args.min_instance_size
+        )
+        
+        print(f"\nData preprocessing complete!")
+        print(f"  Processed {train_count} training samples")
+        print(f"  Processed {val_count} validation samples")
+        print(f"  Output directory: {args.output_folder}")
+        
+        print(f"\nDirectory structure:")
+        print(f"  {args.output_folder}/")
+        print(f"  ├── train/")
+        print(f"  │   ├── images/")
+        print(f"  │   └── masks/")
+        print(f"  └── val/")
+        print(f"      ├── images/")
+        print(f"      └── masks/")
     
     # Report filtering results
     if args.min_instance_size > 0 and filtering_info:
@@ -484,15 +721,6 @@ def main():
                 print(f"    Removed areas: {info['removed_areas']}")
                 print(f"    Kept areas: {info['kept_areas']}")
                 print()
-    
-    print(f"\nDirectory structure:")
-    print(f"  {args.output_folder}/")
-    print(f"  ├── train/")
-    print(f"  │   ├── images/")
-    print(f"  │   └── masks/")
-    print(f"  └── val/")
-    print(f"      ├── images/")
-    print(f"      └── masks/")
 
 
 if __name__ == "__main__":

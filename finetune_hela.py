@@ -45,8 +45,8 @@ def get_dataloader(split, patch_shape, batch_size, train_instance_segmentation):
     os.makedirs(DATA_FOLDER, exist_ok=True)
 
     # This will download the image and segmentation data for training.
-    image_dir = fetch_tracking_example_data(DATA_FOLDER)
-    segmentation_dir = fetch_tracking_segmentation_data(DATA_FOLDER)
+    image_dir = os.path.join(DATA_FOLDER, "DIC")
+    segmentation_dir = os.path.join(DATA_FOLDER, "DIC_mask")
 
     # 'torch_em.default_segmentation_loader' is a convenience function to build a torch dataloader
     # from image data and labels for training segmentation models.
@@ -323,7 +323,7 @@ def create_loss_plots(epoch_train_losses, epoch_val_losses, all_batch_losses, sa
     
     # Create figure with subplots
     fig, axes = plt.subplots(2, 2, figsize=(15, 12))
-    fig.suptitle('Training Loss Curves - Hela Cell SAM Fine-tuning', fontsize=16, fontweight='bold')
+    fig.suptitle('Training Loss Curves - Cell SAM Fine-tuning', fontsize=16, fontweight='bold')
     
     # Plot 1: Epoch-wise Training and Validation Loss
     ax1 = axes[0, 0]
@@ -562,7 +562,7 @@ def main():
     """
     # The model_type determines which base model is used to initialize the weights that are finetuned.
     # We use vit_b here because it can be trained faster. Note that vit_h usually yields higher quality results.
-    model_type = "vit_b"
+    model_type = "vit_b_lm"
 
     # The name of the checkpoint. The checkpoints will be stored in './checkpoints/<checkpoint_name>'
     checkpoint_name = "sam_yeast"
