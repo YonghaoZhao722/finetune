@@ -92,8 +92,8 @@ def get_custom_peft_kwargs(args):
 
 def get_data_loaders(input_path=None):
     # Use local data paths
-    image_path = "/Volumes/ExFAT/finetune/processed_data/DIC"
-    mask_path = "/Volumes/ExFAT/finetune/processed_data/DIC_mask"
+    image_path = "processed_data/DIC"
+    mask_path = "processed_data/DIC_mask"
     
     additional_kwargs = {
         "raw_transform": RawTrafo(desired_shape=(512, 512), triplicate_dims=True, do_padding=False),
