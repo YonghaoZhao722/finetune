@@ -3,8 +3,7 @@ import argparse
 
 import torch
 
-from torch_em.data import MinInstanceSampler
-from torch_em.data.datasets import get_orgasegment_loader
+from torch_em.data import MinInstanceSampler, get_data_loader
 from torch_em.transform.label import PerObjectDistanceTransform
 
 import micro_sam.training as sam_training
@@ -13,7 +12,7 @@ from micro_sam.util import export_custom_sam_model, export_custom_qlora_model
 from peft_sam.util import get_default_peft_kwargs, get_peft_kwargs, RawTrafo
 
 
-DATA_ROOT = "processed_data"
+# DATA_ROOT = "processed_data"  # No longer needed - using local paths directly
 
 
 def get_custom_peft_kwargs(args):
@@ -91,7 +90,11 @@ def get_custom_peft_kwargs(args):
     return peft_kwargs
 
 
-def get_data_loaders(input_path):
+def get_data_loaders(input_path=None):
+    # Use local data paths
+    image_path = "/Volumes/ExFAT/finetune/processed_data/DIC"
+    mask_path = "/Volumes/ExFAT/finetune/processed_data/DIC_mask"
+    
     additional_kwargs = {
         "raw_transform": RawTrafo(desired_shape=(512, 512), triplicate_dims=True, do_padding=False),
         "label_transform": PerObjectDistanceTransform(
@@ -101,12 +104,40 @@ def get_data_loaders(input_path):
         "shuffle": True,
     }
 
-    train_loader = get_orgasegment_loader(
-        path=input_path, patch_shape=(512, 512), split="train", batch_size=1, download=True, **additional_kwargs,
+    # Create train and validation loaders using local data
+    # For training: use first 80% of images, for validation: use last 20%
+    import glob
+    image_files = sorted(glob.glob(os.path.join(image_path, "*")))
+    mask_files = sorted(glob.glob(os.path.join(mask_path, "*")))
+    
+    # Split data: 80% train, 20% validation
+    split_idx = int(0.8 * len(image_files))
+    
+    train_image_files = image_files[:split_idx]
+    train_mask_files = mask_files[:split_idx]
+    val_image_files = image_files[split_idx:]
+    val_mask_files = mask_files[split_idx:]
+    
+    train_loader = get_data_loader(
+        raw_paths=train_image_files,
+        raw_key=None,  # for image files, not HDF5
+        label_paths=train_mask_files,
+        label_key=None,  # for image files, not HDF5
+        patch_shape=(512, 512),
+        batch_size=1,
+        **additional_kwargs,
     )
-    val_loader = get_orgasegment_loader(
-        path=input_path, patch_shape=(512, 512), split="val", batch_size=1, download=True, **additional_kwargs,
+    
+    val_loader = get_data_loader(
+        raw_paths=val_image_files,
+        raw_key=None,  # for image files, not HDF5
+        label_paths=val_mask_files,
+        label_key=None,  # for image files, not HDF5
+        patch_shape=(512, 512),
+        batch_size=1,
+        **additional_kwargs,
     )
+    
     return train_loader, val_loader
 
 
@@ -136,7 +167,7 @@ def finetune_sam(args):
         checkpoint_name = f"{model_type}/{args.peft_method}/orgasegment_sam"
 
     # all the stuff we need for training
-    train_loader, val_loader = get_data_loaders(DATA_ROOT)
+    train_loader, val_loader = get_data_loaders()
     print("PEFT arguments: ", peft_kwargs)
 
     # Run training.
