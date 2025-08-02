@@ -10,10 +10,85 @@ from torch_em.transform.label import PerObjectDistanceTransform
 import micro_sam.training as sam_training
 from micro_sam.util import export_custom_sam_model, export_custom_qlora_model
 
-from peft_sam.util import get_default_peft_kwargs, RawTrafo
+from peft_sam.util import get_default_peft_kwargs, get_peft_kwargs, RawTrafo
 
 
 DATA_ROOT = "processed_data"
+
+
+def get_custom_peft_kwargs(args):
+    """Get PEFT kwargs based on command line arguments, falling back to defaults where needed."""
+    if args.peft_method == "freeze_encoder":
+        return {}
+    
+    # Start with default kwargs
+    peft_kwargs = get_default_peft_kwargs(args.peft_method)
+    
+    # Parse attention_layers_to_update if provided
+    attention_layers_to_update = []
+    if args.attention_layers_to_update is not None:
+        attention_layers_to_update = [int(x.strip()) for x in args.attention_layers_to_update.split(',')]
+    
+    # Parse update_matrices if provided
+    update_matrices = None
+    if args.update_matrices is not None:
+        update_matrices = [x.strip() for x in args.update_matrices.split(',')]
+    
+    # Override with custom parameters if provided
+    custom_kwargs = {}
+    if args.peft_rank is not None:
+        custom_kwargs['peft_rank'] = args.peft_rank
+    if args.dropout is not None:
+        custom_kwargs['dropout'] = args.dropout
+    if args.alpha is not None:
+        custom_kwargs['alpha'] = args.alpha
+    if args.projection_size is not None:
+        custom_kwargs['projection_size'] = args.projection_size
+    if args.quantize:
+        custom_kwargs['quantize'] = True
+    if attention_layers_to_update:
+        custom_kwargs['attention_layers_to_update'] = attention_layers_to_update
+    if update_matrices is not None:
+        custom_kwargs['update_matrices'] = update_matrices
+    
+    # If any custom parameters are provided, rebuild the kwargs
+    if custom_kwargs:
+        # Extract the base method parameters from default kwargs
+        if args.peft_method in ["lora", "qlora"]:
+            peft_kwargs = get_peft_kwargs(
+                peft_module="lora",
+                peft_rank=custom_kwargs.get('peft_rank', 32),
+                quantize=custom_kwargs.get('quantize', args.peft_method == "qlora"),
+                attention_layers_to_update=custom_kwargs.get('attention_layers_to_update', []),
+                update_matrices=custom_kwargs.get('update_matrices', ["q", "v"])
+            )
+        elif args.peft_method == "fact":
+            peft_kwargs = get_peft_kwargs(
+                peft_module="fact",
+                peft_rank=custom_kwargs.get('peft_rank', 16),
+                dropout=custom_kwargs.get('dropout', 0.1)
+            )
+        elif args.peft_method == "adaptformer":
+            peft_kwargs = get_peft_kwargs(
+                peft_module="adaptformer",
+                alpha=custom_kwargs.get('alpha', "learnable_scalar"),
+                dropout=custom_kwargs.get('dropout', None),
+                projection_size=custom_kwargs.get('projection_size', 64)
+            )
+        elif args.peft_method == "late_lora":
+            peft_kwargs = get_peft_kwargs(
+                peft_module="lora",
+                peft_rank=custom_kwargs.get('peft_rank', 32),
+                attention_layers_to_update=custom_kwargs.get('attention_layers_to_update', list(range(6, 12))),
+                update_matrices=custom_kwargs.get('update_matrices', ["q", "k", "v", "mlp"])
+            )
+        elif args.peft_method == "late_ft":
+            peft_kwargs = get_peft_kwargs(
+                peft_module="ClassicalSurgery",
+                attention_layers_to_update=custom_kwargs.get('attention_layers_to_update', list(range(6, 12)))
+            )
+    
+    return peft_kwargs
 
 
 def get_data_loaders(input_path):
@@ -52,7 +127,7 @@ def finetune_sam(args):
         peft_kwargs = {}
     else:
         freeze_parts = None
-        peft_kwargs = get_default_peft_kwargs(args.peft_method)
+        peft_kwargs = get_custom_peft_kwargs(args)
 
     # specify checkpoint path depending on the type of finetuning
     if args.peft_method is None:
@@ -107,6 +182,18 @@ def main():
             "adaptformer", "bias_tuning", "layernorm_tuning", "ssf", "late_lora", "late_ft"
         ],
     )
+    
+    # PEFT method specific parameters
+    parser.add_argument("--peft_rank", type=int, default=None, help="Rank for PEFT methods like LoRA, FacT")
+    parser.add_argument("--dropout", type=float, default=None, help="Dropout rate for FacT and AdaptFormer")
+    parser.add_argument("--alpha", type=str, default=None, help="Alpha parameter for AdaptFormer (can be 'learnable_scalar' or a float)")
+    parser.add_argument("--projection_size", type=int, default=None, help="Projection size for AdaptFormer")
+    parser.add_argument("--quantize", action="store_true", help="Enable quantization for QLoRA")
+    parser.add_argument("--attention_layers_to_update", type=str, default=None, 
+                       help="Comma-separated list of attention layer indices to update (e.g., '6,7,8,9,10,11')")
+    parser.add_argument("--update_matrices", type=str, default=None,
+                       help="Comma-separated list of matrices to update (e.g., 'q,k,v,mlp')")
+    
     args = parser.parse_args()
     finetune_sam(args)
 
